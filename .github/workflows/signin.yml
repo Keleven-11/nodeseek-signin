@@ -20,65 +20,105 @@ jobs:
           echo "计划北京时间 $H 点签到（延迟 ${DELAY} 秒）"
           sleep $DELAY
 
+      - name: 安装 Python 依赖 (curl_cffi)
+        run: pip install curl_cffi
+
       - name: 签到领鸡腿
         id: signin
         env:
           NS_COOKIE_RAW: ${{ secrets.NS_COOKIE }}
         run: |
-          COOKIE="$NS_COOKIE_RAW"
-          # 兼容 Netscape cookie 文件格式：直接粘贴浏览器导出的整个文件内容也行
-          if printf '%s' "$COOKIE" | grep -q "$(printf '\t')"; then
-            COOKIE=$(printf '%s' "$COOKIE" | awk -F'\t' '!/^#/ && NF>=7 {printf "%s=%s; ", $6, $7}' | sed 's/; $//')
-          fi
-          HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' 'https://www.nodeseek.com/api/attendance?random=true' \
-            -X POST --compressed \
-            -H "Cookie: $COOKIE" \
-            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
-            -H 'Referer: https://www.nodeseek.com/' \
-            -H 'Origin: https://www.nodeseek.com' \
-            -H 'Accept: application/json' \
-            --max-time 30)
-          BODY=$(cat /tmp/resp.txt 2>/dev/null)
-          echo "HTTP $HTTP_CODE"
-          echo "Response: $BODY" | head -c 500
-          echo
-          # 解析返回 JSON，提取鸡腿数字段
-          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          python3 - <<'PYEOF'
+          import os
+          import sys
           import json
+          from curl_cffi import requests
+
+          # 1. 处理 Cookie (兼容 Netscape 格式和普通字符串)
+          raw_cookie = os.environ.get("NS_COOKIE_RAW", "")
+          if "\t" in raw_cookie:
+              cookie_parts = []
+              for line in raw_cookie.splitlines():
+                  if line.startswith("#") or not line.strip():
+                      continue
+                  parts = line.split("\t")
+                  if len(parts) >= 7:
+                      cookie_parts.append(f"{parts[5]}={parts[6]}")
+              cookie = "; ".join(cookie_parts)
+          else:
+              cookie = raw_cookie
+
+          url = "https://www.nodeseek.com/api/attendance?random=true"
+          headers = {
+              "Cookie": cookie,
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              "Referer": "https://www.nodeseek.com/",
+              "Origin": "https://www.nodeseek.com",
+              "Accept": "application/json"
+          }
+
+          # 2. 发送请求 (使用 curl_cffi 模拟 Chrome 浏览器)
           try:
-              d = json.load(open('/tmp/resp.txt'))
-          except Exception:
-              d = {}
-          def num(k):
-              v = d.get(k)
-              return v if isinstance(v, (int, float)) else ''
-          print('gain=%s' % num('gain'))
-          print('current=%s' % num('current'))
-          msg = str(d.get('message', '')).replace('\n', ' ')
-          print('api_message=%s' % msg)
+              # impersonate="chrome120" 是绕过 Cloudflare 的关键
+              r = requests.post(url, headers=headers, json={}, impersonate="chrome120", timeout=30)
+              body = r.text
+              http_code = r.status_code
+          except Exception as e:
+              body = ""
+              http_code = 0
+              print(f"请求异常: {e}")
+
+          print(f"HTTP {http_code}")
+          print(f"Response: {body[:500]}")
+
+          # 3. 解析返回结果
+          result = "failed"
+          detail = ""
+          gain = ""
+          current = ""
+          api_message = ""
+
+          try:
+              d = json.loads(body)
+              gain = d.get("gain", "")
+              current = d.get("current", "")
+              api_message = str(d.get("message", "")).replace("\n", " ")
+          except:
+              pass
+
+          # 4. 结果分类
+          if '"success":true' in body.replace(" ", ""):
+              result = "success"
+          elif http_code in [401, 403]:
+              result = "expired"
+              detail = f"接口返回 HTTP {http_code}"
+          elif any(kw in body.lower() for kw in ["未登录", "请先登录", "请登录", "登录已过期", "登录失效", "need login", "not logged", "unauthorized", "session"]):
+              result = "expired"
+              detail = "接口提示需要重新登录"
+          elif "just a moment" in body.lower() or "challenge-platform" in body.lower():
+              result = "failed"
+              detail = "触发 Cloudflare 验证 (curl_cffi 仍被拦截，建议搭配代理)"
+          elif not body:
+              result = "failed"
+              detail = "接口无返回（网络超时或连接失败）"
+          else:
+              result = "failed"
+              detail = f"未知返回：{body[:200]}"
+
+          # 5. 输出到 GITHUB_OUTPUT
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"gain={gain}\n")
+              f.write(f"current={current}\n")
+              f.write(f"api_message={api_message}\n")
+              f.write(f"result={result}\n")
+              f.write(f"detail={detail}\n")
+
+          if result == "success":
+              print("签到成功")
+          else:
+              print(f"签到失败 [{result}] {detail}")
+              sys.exit(1)
           PYEOF
-          # 结果分类：success / expired（登录态失效）/ failed（其他失败）
-          if echo "$BODY" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
-            RESULT=success; DETAIL=""
-          elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
-            RESULT=expired; DETAIL="接口返回 HTTP $HTTP_CODE"
-          elif echo "$BODY" | grep -qiE '未登录|请先登录|请登录|登录已过期|登录失效|need login|not logged|unauthorized|session[^a-z0-9]*invalid|session[^a-z0-9]*expired|身份过期|凭证过期'; then
-            RESULT=expired; DETAIL="接口提示需要重新登录"
-          elif echo "$BODY" | grep -qi 'just a moment\|challenge-platform'; then
-            RESULT=failed; DETAIL="触发 Cloudflare 验证"
-          elif [ -z "$BODY" ]; then
-            RESULT=failed; DETAIL="接口无返回（网络超时或连接失败）"
-          else
-            RESULT=failed; DETAIL="未知返回：$(echo "$BODY" | tr '\n' ' ' | head -c 200)"
-          fi
-          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
-          if [ "$RESULT" = "success" ]; then
-            echo "签到成功"
-          else
-            echo "签到失败 [$RESULT] $DETAIL"
-            exit 1
-          fi
 
       - name: WxPusher 签到成功通知
         if: steps.signin.outputs.result == 'success'
