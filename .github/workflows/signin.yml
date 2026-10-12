@@ -29,22 +29,20 @@ jobs:
           NS_COOKIE_RAW: ${{ secrets.NS_COOKIE }}
         run: |
           python3 - <<'PYEOF'
-          import os
-          import sys
-          import json
+          import os, sys, json
           from curl_cffi import requests
 
-          # 1. 处理 Cookie (兼容 Netscape 格式和普通字符串)
+          # 兼容 Netscape cookie 文件格式：直接粘贴浏览器导出的整个文件内容也行
           raw_cookie = os.environ.get("NS_COOKIE_RAW", "")
           if "\t" in raw_cookie:
-              cookie_parts = []
+              parts = []
               for line in raw_cookie.splitlines():
                   if line.startswith("#") or not line.strip():
                       continue
-                  parts = line.split("\t")
-                  if len(parts) >= 7:
-                      cookie_parts.append(f"{parts[5]}={parts[6]}")
-              cookie = "; ".join(cookie_parts)
+                  f = line.split("\t")
+                  if len(f) >= 7:
+                      parts.append(f"{f[5]}={f[6]}")
+              cookie = "; ".join(parts)
           else:
               cookie = raw_cookie
 
@@ -54,67 +52,52 @@ jobs:
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
               "Referer": "https://www.nodeseek.com/",
               "Origin": "https://www.nodeseek.com",
-              "Accept": "application/json"
+              "Accept": "application/json",
           }
-
-          # 2. 发送请求 (使用 curl_cffi 模拟 Chrome 浏览器)
           try:
-              # impersonate="chrome120" 是绕过 Cloudflare 的关键
+              # impersonate="chrome120"：伪装 Chrome 的 TLS 指纹，是通过 Cloudflare 的关键
               r = requests.post(url, headers=headers, json={}, impersonate="chrome120", timeout=30)
-              body = r.text
-              http_code = r.status_code
+              body, http_code = r.text, r.status_code
           except Exception as e:
-              body = ""
-              http_code = 0
+              body, http_code = "", 0
               print(f"请求异常: {e}")
 
           print(f"HTTP {http_code}")
           print(f"Response: {body[:500]}")
 
-          # 3. 解析返回结果
-          result = "failed"
-          detail = ""
-          gain = ""
-          current = ""
-          api_message = ""
-
           try:
               d = json.loads(body)
-              gain = d.get("gain", "")
-              current = d.get("current", "")
-              api_message = str(d.get("message", "")).replace("\n", " ")
-          except:
-              pass
+          except Exception:
+              d = {}
+          gain = d.get("gain") if isinstance(d.get("gain"), (int, float)) else ""
+          current = d.get("current") if isinstance(d.get("current"), (int, float)) else ""
+          api_message = str(d.get("message", "")).replace("\n", " ")
+          ok = d.get("success") is True
+          already = "已完成签到" in api_message or "重复操作" in api_message
 
-          # 4. 结果分类
-          if '"success":true' in body.replace(" ", ""):
-              result = "success"
-          elif http_code in [401, 403]:
-              result = "expired"
-              detail = f"接口返回 HTTP {http_code}"
-          elif any(kw in body.lower() for kw in ["未登录", "请先登录", "请登录", "登录已过期", "登录失效", "need login", "not logged", "unauthorized", "session"]):
-              result = "expired"
-              detail = "接口提示需要重新登录"
-          elif "just a moment" in body.lower() or "challenge-platform" in body.lower():
-              result = "failed"
-              detail = "触发 Cloudflare 验证 (curl_cffi 仍被拦截，建议搭配代理)"
+          # 结果分类（注意顺序：先排除 Cloudflare 拦截页，它也可能返回 403）
+          low = body.lower()
+          if ok:
+              result, detail = "success", ""
+          elif already:
+              # 今天已经签过：视为成功，避免重复告警
+              result, detail = "success", "（今日已签到，本次未重复操作）"
+          elif "just a moment" in low or "challenge-platform" in low or "challenges.cloudflare.com" in low:
+              result, detail = "failed", "触发 Cloudflare 验证"
+          elif http_code in (401, 403):
+              result, detail = "expired", f"接口返回 HTTP {http_code}"
+          elif any(k in low for k in ["未登录", "请先登录", "请登录", "登录已过期", "登录失效", "need login", "not logged", "unauthorized"]):
+              result, detail = "expired", "接口提示需要重新登录"
           elif not body:
-              result = "failed"
-              detail = "接口无返回（网络超时或连接失败）"
+              result, detail = "failed", "接口无返回（网络超时或连接失败）"
           else:
-              result = "failed"
-              detail = f"未知返回：{body[:200]}"
+              result, detail = "failed", f"未知返回：{body[:200]}"
 
-          # 5. 输出到 GITHUB_OUTPUT
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"gain={gain}\n")
-              f.write(f"current={current}\n")
-              f.write(f"api_message={api_message}\n")
-              f.write(f"result={result}\n")
-              f.write(f"detail={detail}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"gain={gain}\ncurrent={current}\napi_message={api_message}\nresult={result}\ndetail={detail}\n")
 
           if result == "success":
-              print("签到成功")
+              print(f"签到成功 {detail}")
           else:
               print(f"签到失败 [{result}] {detail}")
               sys.exit(1)
