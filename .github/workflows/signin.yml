@@ -1,0 +1,101 @@
+# .github/workflows/signin.yml
+name: NodeSeek 每日签到
+
+on:
+  schedule:
+    # 每天 23:00 UTC = 北京时间次日 07:00
+    - cron: '0 23 * * *'
+  workflow_dispatch:  # 允许手动触发（用于测试）
+
+jobs:
+  signin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 随机整点延迟（北京时间 7:00–21:00）
+        run: |
+          H=$((7 + RANDOM % 15))
+          S=$((RANDOM % 50 + 5))
+          DELAY=$(( (H - 7) * 3600 + S ))
+          echo "计划北京时间 $H 点签到（延迟 ${DELAY} 秒）"
+          sleep $DELAY
+
+      - name: 签到领鸡腿
+        id: signin
+        env:
+          NS_COOKIE_RAW: ${{ secrets.NS_COOKIE }}
+        run: |
+          COOKIE="$NS_COOKIE_RAW"
+          # 兼容 Netscape cookie 文件格式：直接粘贴浏览器导出的整个文件内容也行
+          if printf '%s' "$COOKIE" | grep -q "$(printf '\t')"; then
+            COOKIE=$(printf '%s' "$COOKIE" | awk -F'\t' '!/^#/ && NF>=7 {printf "%s=%s; ", $6, $7}' | sed 's/; $//')
+          fi
+          HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' 'https://www.nodeseek.com/api/attendance?random=true' \
+            -X POST --compressed \
+            -H "Cookie: $COOKIE" \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            -H 'Referer: https://www.nodeseek.com/' \
+            -H 'Origin: https://www.nodeseek.com' \
+            -H 'Accept: application/json' \
+            --max-time 30)
+          BODY=$(cat /tmp/resp.txt 2>/dev/null)
+          echo "HTTP $HTTP_CODE"
+          echo "Response: $BODY" | head -c 500
+          echo
+          # 结果分类：success / expired（登录态失效）/ failed（其他失败）
+          if echo "$BODY" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
+            RESULT=success; DETAIL=""
+          elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+            RESULT=expired; DETAIL="接口返回 HTTP $HTTP_CODE"
+          elif echo "$BODY" | grep -qiE '未登录|请先登录|请登录|登录已过期|登录失效|need login|not logged|unauthorized|session[^a-z0-9]*invalid|session[^a-z0-9]*expired|身份过期|凭证过期'; then
+            RESULT=expired; DETAIL="接口提示需要重新登录"
+          elif echo "$BODY" | grep -qi 'just a moment\|challenge-platform'; then
+            RESULT=failed; DETAIL="触发 Cloudflare 验证"
+          elif [ -z "$BODY" ]; then
+            RESULT=failed; DETAIL="接口无返回（网络超时或连接失败）"
+          else
+            RESULT=failed; DETAIL="未知返回：$(echo "$BODY" | tr '\n' ' ' | head -c 200)"
+          fi
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+          if [ "$RESULT" = "success" ]; then
+            echo "签到成功"
+          else
+            echo "签到失败 [$RESULT] $DETAIL"
+            exit 1
+          fi
+
+      - name: WxPusher 失败告警
+        if: failure()
+        env:
+          WXPUSHER_URL: ${{ secrets.WXPUSHER_URL }}
+          SIGNIN_RESULT: ${{ steps.signin.outputs.result }}
+          SIGNIN_DETAIL: ${{ steps.signin.outputs.detail }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, urllib.parse, urllib.request
+          base = os.environ.get("WXPUSHER_URL", "")
+          if not base:
+              print("未配置 WXPUSHER_URL secret，跳过微信推送")
+              raise SystemExit(0)
+          result = os.environ.get("SIGNIN_RESULT") or "failed"
+          detail = os.environ.get("SIGNIN_DETAIL") or "步骤异常中断，请查看 Actions 日志"
+          if result == "expired":
+              title = "NodeSeek 签到失败：Cookie 已过期"
+              content = ("原因：登录态失效（%s）。\n请重新导出浏览器 cookie，更新仓库 Secrets 中的 NS_COOKIE，然后手动重跑一次 workflow。" % detail)
+          else:
+              title = "NodeSeek 签到失败"
+              content = ("原因：%s。\n请到 GitHub Actions 查看本次运行日志排查，必要时手动重跑一次。" % detail)
+          url = base + "?" + urllib.parse.urlencode({"title": title, "content": content})
+          ok = False
+          for i in range(3):
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      print("WxPusher 推送成功，HTTP", r.status)
+                  ok = True
+                  break
+              except Exception as e:
+                  print("推送第 %d 次失败：%s" % (i + 1, e))
+          if not ok:
+              print("WxPusher 推送失败（已重试 3 次）")
+          PYEOF
